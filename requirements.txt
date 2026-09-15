@@ -1,0 +1,6 @@
+korail-mobile-api @ git+https://github.com/yakisoba0728/korail-mobile-api.git@e798fbcf08e56297b4d16a5c300bd7a4f167722d
+inquirer>=3.4,<4
+keyring>=25,<26
+requests>=2.32,<3
+readchar>=4.2,<5
+httpx>=0.28,<0.29
