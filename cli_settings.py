@@ -51,24 +51,7 @@ def create_app():
         print("텔레그램 설정을 저장했습니다. 예약 성공 시 알림을 보냅니다.")
         return True
 
-    def set_card():
-        fields = (("number", "카드 번호"), ("password", "카드 비밀번호 앞 2자리"),
-                  ("birthday", "생년월일 YYMMDD / 사업자등록번호"), ("expire", "유효기간 YYMM"))
-        result = app.inquirer.prompt([
-            app.inquirer.Password(name, message=label,
-                                  default=app.keyring.get_password("card", name) or "")
-            for name, label in fields
-        ])
-        if not result:
-            return False
-        for name, _ in fields:
-            app.keyring.set_password("card", name, result[name])
-        app.keyring.set_password("card", "ok", "1")
-        print("카드 설정을 저장했습니다. 결제는 공식 앱에서 진행하세요.")
-        return True
-
     app.set_station = set_station
     app.edit_station = edit_station
     app.set_telegram = set_telegram
-    app.set_card = set_card
     return app

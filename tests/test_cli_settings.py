@@ -20,7 +20,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_cancelled_settings_do_not_write_credentials(self):
         self.app.inquirer.prompt.return_value = None
-        for action in (self.app.set_station, self.app.edit_station, self.app.set_telegram, self.app.set_card):
+        for action in (self.app.set_station, self.app.edit_station, self.app.set_telegram):
             self.assertFalse(action())
         self.app.keyring.set_password.assert_not_called()
 

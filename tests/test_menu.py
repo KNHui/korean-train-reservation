@@ -11,7 +11,7 @@ class MenuTests(unittest.TestCase):
             inquirer=SimpleNamespace(list_input=Mock(), prompt=Mock(), Checkbox=Mock()),
             keyring=SimpleNamespace(get_password=Mock(return_value=None), set_password=Mock()),
             **{name: Mock() for name in (
-                "reserve", "check_reservation", "set_login", "set_telegram", "set_card",
+                "reserve", "check_reservation", "set_login", "set_telegram",
                 "set_station", "edit_station", "set_options",
             )},
         )
@@ -20,19 +20,20 @@ class MenuTests(unittest.TestCase):
         app = self.make_app()
         app.inquirer.list_input.side_effect = [
             "reserve", "reservations", "login", "stations", "edit_stations",
-            "telegram", "card", "passengers", "exit",
+            "telegram", "passengers", "exit",
         ]
         run_menu(app, debug=True)
         for name in ("reserve", "check_reservation", "set_login"):
             getattr(app, name).assert_called_once_with("KTX", True)
         for name in ("set_station", "edit_station"):
             getattr(app, name).assert_called_once_with("KTX")
-        for name in ("set_telegram", "set_card", "set_options"):
+        for name in ("set_telegram", "set_options"):
             getattr(app, name).assert_called_once_with()
-        self.assertEqual(app.inquirer.list_input.call_count, 9)
+        self.assertEqual(app.inquirer.list_input.call_count, 8)
         for call in app.inquirer.list_input.call_args_list:
             self.assertNotIn("열차 선택", call.kwargs["message"])
             self.assertNotIn("SRT", str(call.kwargs["choices"]))
+            self.assertNotIn("card", dict((value, label) for label, value in call.kwargs["choices"]))
 
     def test_ktx_passenger_preferences_are_kept(self):
         app = self.make_app()
