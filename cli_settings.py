@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import inquirer
 import keyring
+from keyring.errors import PasswordDeleteError
 
 import payment
 from stations import merge_stations
@@ -74,11 +75,25 @@ def create_app():
         return True
 
     def clear_card():
-        for name in [name for name, _ in payment.FIELDS] + ["ok"]:
+        names = [name for name, _ in payment.FIELDS] + ["ok"]
+        for name in names:
             try:
                 app.keyring.delete_password(payment.SERVICE, name)
-            except Exception:
+            except PasswordDeleteError:
+                # The entry was never stored; only a real failure matters here.
                 continue
+            except Exception:
+                break
+        # Announce removal only after confirming nothing is left behind, so a
+        # denied or silently failing backend cannot look like a deletion.
+        try:
+            remaining = [name for name in names
+                         if app.keyring.get_password(payment.SERVICE, name) is not None]
+        except Exception:
+            remaining = names
+        if remaining:
+            print("카드 정보를 삭제하지 못했습니다. OS 자격 증명 관리 도구에서 직접 삭제하세요.")
+            return False
         print("저장된 카드 정보를 삭제했습니다.")
         return True
 

@@ -134,6 +134,37 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.store.state(selected), "payment_uncertain")
         self.assertTrue(AttemptStore(self.root / "attempts.json").contains(selected))
 
+    def test_a_reservation_is_announced_even_when_settlement_stops_the_run(self):
+        selected = train()
+        self.adapter.search.return_value = [selected]
+        self.adapter.reserve.return_value = selected
+        self.adapter.payable.return_value = True
+        self.adapter.pay.side_effect = StopRun("접근 제한")
+        with self.assertRaises(StopRun):
+            watch(self.adapter, self.paying_query(), self.budget(), self.store,
+                  self.emit, self.notifier, card=object())
+        # The seat is held whatever the payment did, so the alert must go out.
+        self.notifier.assert_called_once_with(selected, False)
+        self.assertEqual(self.store.state(selected), "payment_uncertain")
+
+    def test_an_exhausted_budget_announces_the_reservation_without_paying(self):
+        selected = train()
+        self.adapter.search.return_value = [selected]
+        self.adapter.payable.return_value = True
+
+        def reserve(train_):
+            # The reservation itself consumed the remaining run time.
+            self.clock.now = 10 ** 6
+            return selected
+
+        self.adapter.reserve.side_effect = reserve
+        with self.assertRaises(StopRun):
+            watch(self.adapter, self.paying_query(), self.budget(max_seconds=60),
+                  self.store, self.emit, self.notifier, card=object())
+        self.adapter.pay.assert_not_called()
+        self.notifier.assert_called_once_with(selected, False)
+        self.assertEqual(self.store.state(selected), "reserved")
+
     def test_a_paid_run_notifies_as_paid(self):
         selected = train()
         self.adapter.search.return_value = [selected]

@@ -617,7 +617,14 @@ def watch(adapter, query, budget, store, emit=print, notifier=None, card=None):
                 emit(f"예약 완료: {reserved}")
                 # Only this path still holds the reservation response that
                 # payment needs; the reconciled paths above cannot rebuild it.
-                result = settle_payment(adapter, train, budget, store, intervals, card, emit)
+                try:
+                    result = settle_payment(adapter, train, budget, store, intervals, card, emit)
+                except BaseException:
+                    # A confirmed reservation must reach the user even when
+                    # settlement stops the run; the seat is held either way.
+                    emit("예약은 완료됐습니다. 결제 여부는 공식 앱에서 구입기한 내에 확인하세요.")
+                    notify_reserved(reserved, notifier, budget.audit, emit)
+                    raise
                 notify_reserved(reserved, notifier, budget.audit, emit, paid=result == "paid")
                 return result
             else:
