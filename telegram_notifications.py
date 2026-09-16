@@ -9,11 +9,12 @@ class TelegramNotifier:
         self.token = token
         self.chat_id = chat_id
 
-    def __call__(self, reservation):
+    def __call__(self, reservation, paid=False):
         message = (
-            "[기차 예약] 예약 성공\n"
+            f"[기차 예약] {'결제 완료' if paid else '예약 성공'}\n"
             f"{str(reservation)[:3500]}\n\n"
-            "결제는 공식 앱에서 구입기한 내에 완료하세요."
+            + ("승차권은 공식 앱에서 확인하세요." if paid
+               else "결제는 공식 앱에서 구입기한 내에 완료하세요.")
         )
         # One separate notification request, even if the railway budget is spent.
         # Do not retry ambiguous delivery or expose URLs containing the bot token.

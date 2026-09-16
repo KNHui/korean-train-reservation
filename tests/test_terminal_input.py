@@ -88,7 +88,7 @@ class NavigationTests(unittest.TestCase):
         events = KeyEventGenerator(key_generator=iter([
             key.ENTER, key.ENTER, key.ESC, key.UP, key.ENTER,
             key.ENTER, key.ENTER, key.ENTER, key.ENTER, key.ENTER,
-            key.ENTER, key.ENTER, key.ENTER, key.BACKSPACE, "2", key.ENTER, "y",
+            key.ENTER, key.ENTER, key.ENTER, key.BACKSPACE, "2", key.ENTER, "y", "n",
         ]).__next__)
         app = SimpleNamespace(
             inquirer=NavigationInquirer(inquirer),
@@ -108,6 +108,7 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(args[args.index("--interval") + 1], "15")
         self.assertEqual(args[args.index("--max-interval") + 1], "30")
         self.assertIn("--reserve", args)
+        self.assertNotIn("--pay", args)
 
     def test_reservation_escape_does_not_start_runner(self):
         app = SimpleNamespace(

@@ -27,6 +27,10 @@ class StopRun(Exception):
     """A local limit or server restriction requires stopping this run."""
 
 
+class PaymentRejected(Exception):
+    """The server did not confirm the payment; the charge state is unknown."""
+
+
 class LoginFailure(StopRun):
     """Only local, allowlisted reasons may reach the terminal or audit log."""
 
@@ -118,6 +122,7 @@ class Query:
     disability1to3: int = 0
     disability4to6: int = 0
     seat: str = "general"
+    pay: bool = False
 
     def validate(self):
         if self.rail != "KTX":
@@ -141,6 +146,8 @@ class Query:
             raise ValueError("KTX 예약은 최대 9명까지 가능합니다.")
         if self.seat not in ("general", "special", "general-first", "special-first"):
             raise ValueError("좌석 조건을 확인하세요.")
+        if self.pay and not self.reserve:
+            raise ValueError("자동 결제는 자동예약과 함께만 사용할 수 있습니다.")
 
 
 class Audit:
@@ -327,6 +334,15 @@ class Adapter:
     def reserve(self, train):
         return self.client.reserve(train, self.query)
 
+    def paid_tickets(self):
+        return self.client.paid_tickets()
+
+    def payable(self):
+        return self.client.payable()
+
+    def pay(self, card):
+        return self.client.pay(card)
+
     def login(self):
         try:
             with redirect_stdout(io.StringIO()):
@@ -396,11 +412,11 @@ def retry_read_operation(operation, budget, label, emit=print):
             return result
 
 
-def notify_reserved(reservation, notifier, audit, emit):
+def notify_reserved(reservation, notifier, audit, emit, paid=False):
     if notifier is None:
         return
     try:
-        notifier(reservation)
+        notifier(reservation, paid)
     except Exception as exc:
         audit("telegram", state="failed", error_type=type(exc).__name__)
         emit("예약은 완료됐지만 텔레그램 알림 전송에 실패했습니다. 공식 앱에서 구입기한을 확인하세요.")
@@ -438,7 +454,76 @@ def reconcile_reservation(adapter, train, budget, store, intervals, emit):
         budget.wait(delay)
 
 
-def watch(adapter, query, budget, store, emit=print, notifier=None):
+def reconcile_payment(adapter, train, budget, intervals, emit):
+    """Look for the train on an issued ticket; two clean absences mean unpaid."""
+    absent, errors = 0, 0
+    while True:
+        budget.check()
+        try:
+            found = next((t for t in adapter.paid_tickets()
+                          if train_key(t) == train_key(train)), None)
+        except Exception as exc:
+            budget.audit("reconcile_error", operation="payment", error_type=type(exc).__name__)
+            if is_restriction(exc):
+                raise
+            # A permanently failing read must stop instead of asking forever;
+            # the caller then reports the charge as unconfirmed.
+            errors += 1
+            if errors >= budget.policy.max_errors:
+                emit(f"승차권 내역을 연속 {errors}회 확인하지 못했습니다.")
+                return None
+            absent = 0
+            emit(f"승차권 내역 확인 오류 ({type(exc).__name__}). 대기 후 다시 확인합니다.")
+        else:
+            errors = 0
+            if found is not None:
+                return found
+            absent += 1
+            budget.audit("reconcile", operation="payment", state="absent", count=absent)
+            if absent >= 2:
+                return None
+        delay = intervals.next_delay()
+        emit(f"승차권 내역 재확인까지 {delay:.1f}초 대기")
+        budget.wait(delay)
+
+
+def settle_payment(adapter, train, budget, store, intervals, card, emit):
+    """Send at most one payment for this run's own hold, then verify the result."""
+    if card is None or not adapter.payable():
+        emit("결제는 공식 앱에서 구입기한 내에 완료하세요.")
+        return "reserved"
+    budget.check()
+    # Write before the call so an interrupted payment is never replayed.
+    store.record(train, "payment_uncertain")
+    try:
+        adapter.pay(card)
+    except BaseException as exc:
+        budget.audit("payment_error", error_type=type(exc).__name__)
+        emit(f"결제 완료 확인 실패 ({type(exc).__name__}). 결제 여부를 확인합니다.")
+        if not isinstance(exc, Exception):
+            raise
+        if is_restriction(exc):
+            raise StopRun("결제 중 실행 한도 또는 접근 제한이 확인됐습니다.") from exc
+        # A rejected payment commonly expires the session, and the issued
+        # ticket list cannot be read again until this run logs in once more.
+        if error_kind(exc) == "session":
+            retry_read_operation(adapter.login, budget, "세션 재로그인", emit)
+    else:
+        store.record(train, "paid")
+        budget.audit("payment", state="paid")
+        emit("결제를 완료했습니다. 승차권은 공식 앱에서 확인하세요.")
+        return "paid"
+    if reconcile_payment(adapter, train, budget, intervals, emit) is not None:
+        store.record(train, "paid")
+        budget.audit("payment", state="paid")
+        emit("승차권 내역에서 결제를 확인했습니다.")
+        return "paid"
+    budget.audit("payment", state="uncertain")
+    emit("결제를 확인하지 못했습니다. 공식 앱에서 구입기한 내에 결제하세요.")
+    return "payment_uncertain"
+
+
+def watch(adapter, query, budget, store, emit=print, notifier=None, card=None):
     errors, renewed = 0, False
     intervals = IntervalQueue(budget.policy)
     # Fetch duplicates before polling, away from the seat-discovery hot path.
@@ -530,9 +615,18 @@ def watch(adapter, query, budget, store, emit=print, notifier=None):
                 budget.audit("search", count=attempt, elapsed=budget.clock() - started)
                 budget.audit("reservation", state="reserved")
                 emit(f"예약 완료: {reserved}")
-                emit("결제는 공식 앱에서 구입기한 내에 완료하세요.")
-                notify_reserved(reserved, notifier, budget.audit, emit)
-                return "reserved"
+                # Only this path still holds the reservation response that
+                # payment needs; the reconciled paths above cannot rebuild it.
+                try:
+                    result = settle_payment(adapter, train, budget, store, intervals, card, emit)
+                except BaseException:
+                    # A confirmed reservation must reach the user even when
+                    # settlement stops the run; the seat is held either way.
+                    emit("예약은 완료됐습니다. 결제 여부는 공식 앱에서 구입기한 내에 확인하세요.")
+                    notify_reserved(reserved, notifier, budget.audit, emit)
+                    raise
+                notify_reserved(reserved, notifier, budget.audit, emit, paid=result == "paid")
+                return result
             else:
                 budget.audit("search", count=attempt, elapsed=budget.clock() - started)
                 progress = f"{attempt}/{budget.policy.max_searches}" if budget.policy.max_searches is not None else str(attempt)
@@ -573,7 +667,9 @@ def main(argv=None):
     parser.add_argument("--time", default="000000")
     parser.add_argument("--until", default="235959")
     parser.add_argument("--train-number", default="", help="대상 열차 번호 (생략하면 시간대 내 모든 열차)")
-    parser.add_argument("--reserve", action="store_true", help="조건에 맞는 열차 한 편 예약, 결제 제외")
+    parser.add_argument("--reserve", action="store_true", help="조건에 맞는 열차 한 편 예약")
+    parser.add_argument("--pay", action="store_true",
+                        help="예약 성공 시 저장된 카드로 즉시 결제 (실제로 청구됩니다)")
     parser.add_argument("--adults", type=int, default=1)
     parser.add_argument("--children", type=int, default=0)
     parser.add_argument("--seniors", type=int, default=0)
@@ -595,19 +691,29 @@ def main(argv=None):
                       args.arr or input("도착역: ").strip(),
                       args.date or input("운행일 YYYYMMDD: ").strip(),
                       args.time, args.until, args.train_number, args.reserve,
-                      args.adults, args.children, args.seniors, args.disability1to3, args.disability4to6, args.seat)
+                      args.adults, args.children, args.seniors, args.disability1to3, args.disability4to6,
+                      args.seat, args.pay)
         query.validate()
         with single_instance(RUNTIME / "reservation.lock"):
             audit = Audit(RUNTIME / "events.jsonl")
             store = AttemptStore(RUNTIME / "attempts.json")
+            # Fail before logging in when automatic payment cannot be honoured.
+            card = None
+            if query.pay:
+                from payment import load_card
+                card = load_card()
+            if query.pay and card is None:
+                raise StopRun("사용할 수 있는 카드 설정이 없어 자동 결제를 시작하지 않습니다.")
             user, password = credentials(query.rail)
             client = create_client(query.rail, user, password)
             budget = Budget(policy, audit)
             budget.attach(client)
             adapter = Adapter(client, query.rail, query, audit=audit)
-            audit("run", state="reserve" if query.reserve else "notify")
-            print(f"{'자동예약' if query.reserve else '잔여석 알림'} / "
-                  f"{policy.limit_summary()} (직접 중단: Ctrl+C)")
+            audit("run", state="pay" if query.pay else "reserve" if query.reserve else "notify")
+            mode = "자동예약+자동결제" if query.pay else "자동예약" if query.reserve else "잔여석 알림"
+            print(f"{mode} / {policy.limit_summary()} (직접 중단: Ctrl+C)")
+            if query.pay:
+                print("예약에 성공하면 저장된 카드로 즉시 결제하며 실제로 청구됩니다.")
             print(f"조회 간격: {policy.interval:g}~{policy.max_interval:g}초 / 10개 대기열 균형 조정")
             print(f"대상: {query.departure} → {query.arrival} / {query.date} / "
                   f"{query.start}~{query.end} / "
@@ -618,7 +724,7 @@ def main(argv=None):
                     from telegram_notifications import load_notifier
                     notifier = load_notifier()
                 retry_read_operation(adapter.login, budget, "로그인")
-                result = watch(adapter, query, budget, store, notifier=notifier)
+                result = watch(adapter, query, budget, store, notifier=notifier, card=card)
                 audit("finished", state=result)
                 print("작업을 종료했습니다.")
                 return 0

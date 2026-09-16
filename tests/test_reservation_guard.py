@@ -92,6 +92,91 @@ class GuardTests(unittest.TestCase):
     def booking_query(self):
         return Query("KTX", "서울", "부산", "20990101", "110000", "130000", "1", True)
 
+    def paying_query(self):
+        return replace(self.booking_query(), pay=True)
+
+    def test_payment_requires_the_reservation_mode(self):
+        with self.assertRaises(ValueError):
+            replace(self.query, pay=True).validate()
+        self.paying_query().validate()
+
+    def test_a_card_never_reaches_a_notify_only_run(self):
+        self.adapter.search.return_value = [train()]
+        card = object()
+        result = watch(self.adapter, self.query, self.budget(), self.store,
+                       self.emit, self.notifier, card=card)
+        self.assertEqual(result, "available")
+        self.adapter.pay.assert_not_called()
+
+    def test_a_permanently_unreadable_ticket_list_stops_instead_of_asking_forever(self):
+        selected = train()
+        self.adapter.search.return_value = [selected]
+        self.adapter.reserve.return_value = selected
+        self.adapter.payable.return_value = True
+        self.adapter.pay.side_effect = ValueError("rejected")
+        self.adapter.paid_tickets.side_effect = TimeoutError()
+        result = watch(self.adapter, self.paying_query(), self.budget(), self.store,
+                       self.emit, self.notifier, card=object())
+        self.assertEqual(result, "payment_uncertain")
+        self.adapter.pay.assert_called_once()
+        self.assertEqual(self.adapter.paid_tickets.call_count, Policy().max_errors)
+        self.assertEqual(self.store.state(selected), "payment_uncertain")
+
+    def test_a_payment_is_recorded_before_it_is_sent_so_a_crash_is_not_replayed(self):
+        selected = train()
+        self.adapter.search.return_value = [selected]
+        self.adapter.reserve.return_value = selected
+        self.adapter.payable.return_value = True
+        self.adapter.pay.side_effect = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            watch(self.adapter, self.paying_query(), self.budget(), self.store,
+                  self.emit, self.notifier, card=object())
+        self.assertEqual(self.store.state(selected), "payment_uncertain")
+        self.assertTrue(AttemptStore(self.root / "attempts.json").contains(selected))
+
+    def test_a_reservation_is_announced_even_when_settlement_stops_the_run(self):
+        selected = train()
+        self.adapter.search.return_value = [selected]
+        self.adapter.reserve.return_value = selected
+        self.adapter.payable.return_value = True
+        self.adapter.pay.side_effect = StopRun("접근 제한")
+        with self.assertRaises(StopRun):
+            watch(self.adapter, self.paying_query(), self.budget(), self.store,
+                  self.emit, self.notifier, card=object())
+        # The seat is held whatever the payment did, so the alert must go out.
+        self.notifier.assert_called_once_with(selected, False)
+        self.assertEqual(self.store.state(selected), "payment_uncertain")
+
+    def test_an_exhausted_budget_announces_the_reservation_without_paying(self):
+        selected = train()
+        self.adapter.search.return_value = [selected]
+        self.adapter.payable.return_value = True
+
+        def reserve(train_):
+            # The reservation itself consumed the remaining run time.
+            self.clock.now = 10 ** 6
+            return selected
+
+        self.adapter.reserve.side_effect = reserve
+        with self.assertRaises(StopRun):
+            watch(self.adapter, self.paying_query(), self.budget(max_seconds=60),
+                  self.store, self.emit, self.notifier, card=object())
+        self.adapter.pay.assert_not_called()
+        self.notifier.assert_called_once_with(selected, False)
+        self.assertEqual(self.store.state(selected), "reserved")
+
+    def test_a_paid_run_notifies_as_paid(self):
+        selected = train()
+        self.adapter.search.return_value = [selected]
+        self.adapter.reserve.return_value = selected
+        self.adapter.payable.return_value = True
+        self.adapter.pay.return_value = True
+        result = watch(self.adapter, self.paying_query(), self.budget(), self.store,
+                       self.emit, self.notifier, card=object())
+        self.assertEqual(result, "paid")
+        self.notifier.assert_called_once_with(selected, True)
+        self.assertEqual(self.store.state(selected), "paid")
+
     def test_notify_never_reserves_or_reads_reservations(self):
         self.adapter.search.return_value = [train()]
         result = watch(self.adapter, self.query, self.budget(), self.store, self.emit, self.notifier)
@@ -196,7 +281,7 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(len(self.clock.waits), 100)
         self.assertTrue(all(15 <= delay <= 30 for delay in self.clock.waits))
         self.adapter.reserve.assert_called_once_with(selected)
-        self.notifier.assert_called_once_with(selected)
+        self.notifier.assert_called_once_with(selected, False)
 
     def test_keyboard_interrupt_stops_unlimited_wait_before_next_search(self):
         def interrupt(seconds):
@@ -253,7 +338,7 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(result, "reserved")
         self.adapter.reserve.assert_called_once_with(selected)
         self.adapter.pay_with_card.assert_not_called()
-        self.notifier.assert_called_once_with(selected)
+        self.notifier.assert_called_once_with(selected, False)
 
     def test_discovery_calls_reserve_before_output_audit_or_state_write(self):
         selected = train()
@@ -314,7 +399,7 @@ class GuardTests(unittest.TestCase):
             watch(self.adapter, self.booking_query(), self.budget(),
                   AttemptStore(self.store.path), self.emit, self.notifier)
         self.adapter.reserve.assert_called_once()
-        self.notifier.assert_called_once_with(selected)
+        self.notifier.assert_called_once_with(selected, False)
         self.assertEqual(self.adapter.reservations.call_count, 2)
         output = str(self.emit.call_args_list) + self.audit.path.read_text(encoding="utf-8")
         self.assertIn("텔레그램 알림 전송에 실패", output)
@@ -361,7 +446,7 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(result, "reserved")
         self.assertEqual(self.adapter.reserve.call_count, 1)
         self.assertEqual(self.adapter.reservations.call_count, 2)
-        self.notifier.assert_called_once_with(selected)
+        self.notifier.assert_called_once_with(selected, False)
 
     def test_failed_reservation_retries_after_two_empty_history_checks(self):
         selected = train()
@@ -372,7 +457,7 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.adapter.reserve.call_count, 2)
         self.assertEqual(self.adapter.reservations.call_count, 3)
         self.assertEqual(len(self.clock.waits), 2)
-        self.notifier.assert_called_once_with(selected)
+        self.notifier.assert_called_once_with(selected, False)
 
     def test_delayed_history_success_does_not_reserve_twice(self):
         selected = train()

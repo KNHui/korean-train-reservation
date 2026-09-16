@@ -3,6 +3,7 @@ from dataclasses import replace
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -12,10 +13,19 @@ import httpx
 from korail_mobile_api.errors import KorailSessionExpiredError, KorailTransportError
 
 from korail_adapter import MobileKorail
+from payment import Card
 from reservation_guard import (
     Adapter, AttemptStore, Audit, Budget, LoginFailure, Policy, Query, StopRun,
     error_kind, retry_read_operation, train_key, watch,
 )
+
+
+CARD = Card(number="1234567812345678", password="12", birthday="900101", expire="2812")
+
+
+def ticket_row(number="001", time="120000"):
+    return {"h_trn_no": number, "h_dpt_dt": "20990101", "h_dpt_tm": time,
+            "h_dpt_rs_stn_nm": "수서", "h_arv_rs_stn_nm": "동대구"}
 
 
 BASE = {"strResult": "SUCC", "h_msg_cd": "IRZ000001", "h_msg_txt": "success"}
@@ -48,7 +58,9 @@ class MobileKorailTests(unittest.TestCase):
         self.cookie = True
         self.history = {**BASE, "jrny_infos": {"jrny_info": []}}
         self.tickets = [{**BASE, "tickets": []}]
-        self.reserve_reply = {**BASE, "h_pnr_no": "1234567890", "h_jrny_cnt": "0001"}
+        self.reserve_reply = {**BASE, "h_pnr_no": "1234567890", "h_jrny_cnt": "0001",
+                              "h_wct_no": "0507", "h_tot_rcvd_amt": "0000000000042600"}
+        self.payment_reply = BASE
         self.client = MobileKorail("private-id", "private-password", transport=httpx.MockTransport(self.handle))
         self.addCleanup(self.client.close)
         self.audit = Audit(self.root / "events.jsonl")
@@ -78,6 +90,8 @@ class MobileKorailTests(unittest.TestCase):
             payload = self.tickets.pop(0)
         elif path.endswith("certification.TicketReservation"):
             payload = self.reserve_reply
+        elif path.endswith("payment.ReservationPayment"):
+            payload = self.payment_reply
         else:
             self.fail("Unexpected network route")
         return httpx.Response(200, json=payload, headers=headers)
@@ -296,6 +310,89 @@ class MobileKorailTests(unittest.TestCase):
         self.assertEqual(form["txtTotPsgCnt"], ["3"])
         self.assertEqual(form["txtPsrmClCd1"], ["2"])
         self.assertNotIn("private-", store.path.read_text() + self.audit.path.read_text())
+
+    def pay_run(self, card=CARD, sleep=None):
+        """Reserve one seat and settle it, with waits mocked out."""
+        self.query = replace(self.query, pay=card is not None)
+        self.adapter.query = self.query
+        self.budget = Budget(Policy(), self.audit, sleep=sleep or Mock())
+        self.budget.attach(self.client)
+        self.login()
+        store = AttemptStore(self.root / "attempts.json")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = watch(self.adapter, self.query, self.budget, store,
+                           emit=Mock(), card=card)
+        return result, store, output.getvalue()
+
+    def test_payment_sends_the_acknowledged_card_once_for_the_received_amount(self):
+        with patch.object(self.client.api, "pay_with_card",
+                          wraps=self.client.api.pay_with_card) as pay:
+            result, store, output = self.pay_run()
+        self.assertEqual(result, "paid")
+        pay.assert_called_once()
+        consent = pay.call_args.kwargs["consent"]
+        self.assertTrue(consent.allow_payment)
+        self.assertTrue(consent.real_card_acknowledged)
+        self.assertFalse(consent.fake_card_only or consent.dry_run)
+        self.assertFalse(consent.allow_cancel or consent.allow_refund)
+        route, form, _ = self.calls[-1]
+        self.assertTrue(route.endswith("payment.ReservationPayment"))
+        self.assertEqual(form["hidPnrNo"], ["1234567890"])
+        self.assertEqual(form["hidWctNo"], ["0507"])
+        # The settled figure is the received amount, not the padded display total.
+        self.assertEqual(form["hidMnsStlAmt1"], ["42600"])
+        self.assertEqual(form["hidStlMnsCd1"], ["02"])
+        self.assertEqual(form["hidAthnDvCd1"], ["J"])
+        self.assertEqual(form["hidIsmtMnthNum1"], ["0"])
+        self.assertEqual(store.state(self.reserved_train()), "paid")
+        self.assertNotIn(CARD.number, output + store.path.read_text()
+                         + self.audit.path.read_text())
+
+    def test_without_a_card_the_hold_is_left_unpaid_and_no_payment_is_sent(self):
+        result, store, _ = self.pay_run(card=None)
+        self.assertEqual(result, "reserved")
+        self.assertEqual(store.state(self.reserved_train()), "reserved")
+        self.assertFalse(any(route.endswith("payment.ReservationPayment")
+                             for route, _, _ in self.calls))
+
+    def test_a_rejected_payment_response_is_verified_against_the_ticket_list(self):
+        # P058 expires the session, so verification must log in again first.
+        self.payment_reply = {**BASE, "strResult": "FAIL", "h_msg_cd": "P058"}
+        self.tickets = [{**BASE, "tickets": []},
+                        {**BASE, "reservation_list": [ticket_row()]},
+                        {**BASE, "tickets": []}]
+        with patch.object(self.client.api, "pay_with_card",
+                          wraps=self.client.api.pay_with_card) as pay:
+            result, store, _ = self.pay_run()
+        self.assertEqual(result, "paid")
+        pay.assert_called_once()
+        self.assertEqual(store.state(self.reserved_train()), "paid")
+
+    def test_an_unconfirmed_payment_stops_as_uncertain_and_is_never_retried(self):
+        self.payment_reply = {**BASE, "strResult": "FAIL", "h_msg_cd": "P058"}
+        self.tickets = [{**BASE, "tickets": []}] * 3
+        with patch.object(self.client.api, "pay_with_card",
+                          wraps=self.client.api.pay_with_card) as pay:
+            result, store, _ = self.pay_run()
+        self.assertEqual(result, "payment_uncertain")
+        pay.assert_called_once()
+        train = self.reserved_train()
+        self.assertEqual(store.state(train), "payment_uncertain")
+        # A restart must not send a second charge for the same train.
+        self.assertTrue(AttemptStore(self.root / "attempts.json").contains(train))
+
+    def test_a_paid_hold_cannot_be_settled_a_second_time(self):
+        self.pay_run()
+        self.assertFalse(self.client.payable())
+        with self.assertRaises(StopRun):
+            self.client.pay(CARD)
+
+    @staticmethod
+    def reserved_train():
+        """The attempt key of the train in the default page, without a request."""
+        return SimpleNamespace(dep_date="20990101", train_no="001", dep_name="수서",
+                               arr_name="동대구", dep_time="120000")
 
     def test_reserve_requires_explicit_mode_and_matching_train(self):
         self.login()

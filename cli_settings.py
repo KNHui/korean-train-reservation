@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import inquirer
 import keyring
+from keyring.errors import PasswordDeleteError
 
+import payment
 from stations import merge_stations
 
 
@@ -51,7 +53,53 @@ def create_app():
         print("텔레그램 설정을 저장했습니다. 예약 성공 시 알림을 보냅니다.")
         return True
 
+    def set_card():
+        result = app.inquirer.prompt([
+            app.inquirer.Password(name, message=label,
+                                  default=app.keyring.get_password(payment.SERVICE, name) or "")
+            for name, label in payment.FIELDS
+        ])
+        if not result:
+            return False
+        values = {name: str(result[name]).strip() for name, _ in payment.FIELDS}
+        try:
+            # Reject an unusable card here, not at the moment money would move.
+            payment.Card(**values)
+        except ValueError as exc:
+            print(exc)
+            return False
+        for name, _ in payment.FIELDS:
+            app.keyring.set_password(payment.SERVICE, name, values[name])
+        app.keyring.set_password(payment.SERVICE, "ok", "1")
+        print("카드 설정을 저장했습니다. 자동 결제는 --pay 또는 예매 메뉴에서 선택할 때만 실행합니다.")
+        return True
+
+    def clear_card():
+        names = [name for name, _ in payment.FIELDS] + ["ok"]
+        for name in names:
+            try:
+                app.keyring.delete_password(payment.SERVICE, name)
+            except PasswordDeleteError:
+                # The entry was never stored; only a real failure matters here.
+                continue
+            except Exception:
+                break
+        # Announce removal only after confirming nothing is left behind, so a
+        # denied or silently failing backend cannot look like a deletion.
+        try:
+            remaining = [name for name in names
+                         if app.keyring.get_password(payment.SERVICE, name) is not None]
+        except Exception:
+            remaining = names
+        if remaining:
+            print("카드 정보를 삭제하지 못했습니다. OS 자격 증명 관리 도구에서 직접 삭제하세요.")
+            return False
+        print("저장된 카드 정보를 삭제했습니다.")
+        return True
+
     app.set_station = set_station
     app.edit_station = edit_station
     app.set_telegram = set_telegram
+    app.set_card = set_card
+    app.clear_card = clear_card
     return app
