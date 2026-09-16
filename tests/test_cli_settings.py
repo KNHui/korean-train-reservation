@@ -9,7 +9,8 @@ from train_cli import configure_stations
 class SettingsTests(unittest.TestCase):
     def setUp(self):
         self.app = create_app()
-        self.app.keyring = SimpleNamespace(get_password=Mock(return_value=None), set_password=Mock())
+        self.app.keyring = SimpleNamespace(get_password=Mock(return_value=None),
+                                           set_password=Mock(), delete_password=Mock())
         self.app.inquirer = Mock()
         configure_stations(self.app)
 
@@ -20,7 +21,8 @@ class SettingsTests(unittest.TestCase):
 
     def test_cancelled_settings_do_not_write_credentials(self):
         self.app.inquirer.prompt.return_value = None
-        for action in (self.app.set_station, self.app.edit_station, self.app.set_telegram):
+        for action in (self.app.set_station, self.app.edit_station, self.app.set_telegram,
+                       self.app.set_card):
             self.assertFalse(action())
         self.app.keyring.set_password.assert_not_called()
 
@@ -31,6 +33,38 @@ class SettingsTests(unittest.TestCase):
         send.assert_not_called()
         self.app.keyring.set_password.assert_any_call("telegram", "token", "test-token")
         self.app.keyring.set_password.assert_any_call("telegram", "chat_id", "test-chat")
+
+    def test_card_settings_are_validated_before_they_are_stored(self):
+        self.app.inquirer.prompt.return_value = {
+            "number": " 1234567812345678 ", "password": "12",
+            "birthday": "900101", "expire": "2812",
+        }
+        with patch("builtins.print") as emit:
+            self.assertTrue(self.app.set_card())
+        self.app.keyring.set_password.assert_any_call("card", "number", "1234567812345678")
+        self.app.keyring.set_password.assert_any_call("card", "expire", "2812")
+        self.app.keyring.set_password.assert_any_call("card", "ok", "1")
+        self.assertNotIn("1234567812345678", str(emit.call_args_list))
+
+    def test_an_unusable_card_is_refused_without_storing_a_partial_entry(self):
+        self.app.inquirer.prompt.return_value = {
+            "number": "1234-5678", "password": "12", "birthday": "900101", "expire": "2812",
+        }
+        with patch("builtins.print"):
+            self.assertFalse(self.app.set_card())
+        self.app.keyring.set_password.assert_not_called()
+
+    def test_clearing_the_card_removes_every_entry_including_the_flag(self):
+        with patch("builtins.print"):
+            self.assertTrue(self.app.clear_card())
+        for name in ("number", "password", "birthday", "expire", "ok"):
+            self.app.keyring.delete_password.assert_any_call("card", name)
+
+    def test_clearing_tolerates_entries_the_keyring_no_longer_holds(self):
+        self.app.keyring.delete_password.side_effect = RuntimeError("missing")
+        with patch("builtins.print"):
+            self.assertTrue(self.app.clear_card())
+        self.assertEqual(self.app.keyring.delete_password.call_count, 5)
 
     def test_missing_ktx_preferences_do_not_read_other_accounts(self):
         from train_cli import configure_options

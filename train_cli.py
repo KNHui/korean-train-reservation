@@ -131,6 +131,8 @@ def run_menu(app, debug=False):
         ("예약·승차권 확인", "reservations"),
         ("로그인 설정", "login"),
         ("텔레그램 설정", "telegram"),
+        ("카드 설정", "card"),
+        ("카드 정보 삭제", "clear_card"),
         ("역 설정", "stations"),
         ("역 직접 수정", "edit_stations"),
         ("승객 유형 설정", "passengers"),
@@ -141,6 +143,8 @@ def run_menu(app, debug=False):
         "reservations": lambda: app.check_reservation("KTX", debug),
         "login": lambda: app.set_login("KTX", debug),
         "telegram": app.set_telegram,
+        "card": app.set_card,
+        "clear_card": app.clear_card,
         "stations": lambda: app.set_station("KTX"),
         "edit_stations": lambda: app.edit_station("KTX"),
         "passengers": app.set_options,
@@ -178,7 +182,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="통합 기차 예매")
     parser.add_argument("--list-stations", action="store_true", help="로그인 없이 통합 역 목록 출력")
     parser.add_argument("--debug", action="store_true", help="디버그 모드")
-    parser.add_argument("--reserve", action="store_true", help="조건에 맞는 열차 자동예약을 기본 선택, 결제 제외")
+    parser.add_argument("--reserve", action="store_true", help="조건에 맞는 열차 자동예약을 기본 선택")
+    parser.add_argument("--pay", action="store_true", help="예매 메뉴의 자동 결제를 기본 선택")
     parser.add_argument("--train-number", default="", help="대상 열차 번호 (생략하면 시간대 내 모든 열차)")
     args = parser.parse_args(argv)
     if args.list_stations:
@@ -193,11 +198,11 @@ def main(argv=None):
     configure_options(app)
     configure_login(app)
     configure_reservation_list(app)
-    configure_reservation(app, args.reserve, args.train_number)
+    configure_reservation(app, args.reserve, args.train_number, args.pay)
     run_menu(app, debug=args.debug)
 
 
-def configure_reservation(app, reserve=False, train_number=""):
+def configure_reservation(app, reserve=False, train_number="", pay=False):
     """Use the project runner with queued waits and reservation safeguards."""
     from reservation_guard import Policy, main as guarded_main
 
@@ -225,7 +230,10 @@ def configure_reservation(app, reserve=False, train_number=""):
                 flag = {"child": "children", "senior": "seniors"}.get(key, key)
                 questions.append(app.inquirer.Text(flag, message=f"{label} 인원", default="0"))
         questions.append(app.inquirer.Confirm(
-            "reserve", message="조건에 맞는 열차 한 편을 자동예약 (결제 제외)", default=reserve,
+            "reserve", message="조건에 맞는 열차 한 편을 자동예약", default=reserve,
+        ))
+        questions.append(app.inquirer.Confirm(
+            "pay", message="예약 성공 시 저장된 카드로 즉시 결제 (실제로 청구됩니다)", default=pay,
         ))
         print("Enter: 다음 단계 · Esc: 이전 단계 (첫 단계에서는 메뉴로) · Ctrl+C: 취소")
         print("Home/End: 입력 처음·끝 또는 목록 처음·끝 · ↑/↓: 목록 순환 이동")
@@ -239,6 +247,8 @@ def configure_reservation(app, reserve=False, train_number=""):
                 args += ["--" + key, str(result[key])]
         if result.get("reserve"):
             args += ["--reserve"]
+            if result.get("pay"):
+                args += ["--pay"]
         try:
             return guarded_main(args)
         except SystemExit as exc:

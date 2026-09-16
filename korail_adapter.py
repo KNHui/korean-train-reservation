@@ -1,6 +1,7 @@
 """Project interface for the pinned korail-mobile-api client.
 
-Only explicit reserve mode enables an unpaid hold. No payment/cancel interface.
+Only explicit reserve mode enables an unpaid hold, and only explicit pay mode
+settles it with a real, chargeable card. No cancel or refund interface.
 All requests use the one httpx client exposed to reservation_guard.Budget.
 """
 
@@ -8,15 +9,16 @@ from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 
 from korail_mobile_api import (
-    KorailClient, KorailConfig, KorailPassengerCounts, KorailSeatClass,
-    MutationConsent, TrainSearchQuery,
+    CardPayment, KorailClient, KorailConfig, KorailPassengerCounts,
+    KorailSeatClass, MutationConsent, TrainSearchQuery,
 )
 from korail_mobile_api.errors import (
     KorailAuthError, KorailAuthContinuationRequired, KorailDynaPathError,
     KorailNoResultsError, KorailProtocolError,
 )
 
-from reservation_guard import LoginFailure, StopRun, matches, train_key
+from payment import Card
+from reservation_guard import LoginFailure, PaymentRejected, StopRun, matches, train_key
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,9 @@ class MobileKorail:
 
     def __init__(self, user, password, *, transport=None):
         self._user, self._password = user, password
+        # Only this run's own hold may be paid; payment needs fields that the
+        # reservation history does not carry, so it is never rebuilt later.
+        self._hold = None
         self.api = KorailClient(KorailConfig(enable_dynapath=True, timeout=15), transport=transport)
         self._session = self.api.http._client
 
@@ -157,11 +162,44 @@ class MobileKorail:
         if not hold.pnr_no:
             raise ValueError("Missing reservation confirmation")
         # Never print the raw hold (PNR, payment metadata and account fields).
+        self._hold = hold
         return train
+
+    def payable(self):
+        return self._hold is not None
+
+    def pay(self, card):
+        """Settle this run's hold once with a real card. Never retried."""
+        if not isinstance(card, Card):
+            raise TypeError("card must be a Card instance")
+        hold, self._hold = self._hold, None
+        if hold is None:
+            raise StopRun("이 실행에서 만든 예약이 없어 결제를 진행하지 않습니다.")
+        response = self.api.pay_with_card(
+            hold,
+            CardPayment(
+                card_number=card.number, card_password=card.password,
+                card_expire=card.expire, birthday=card.birthday,
+                installment=str(card.installment), card_type=card.auth_type,
+            ),
+            consent=MutationConsent(
+                allow_payment=True, dry_run=False,
+                fake_card_only=False, real_card_acknowledged=True,
+            ),
+        )
+        # The library returns the response even when the server reports failure,
+        # because an approved charge may already exist. Verify, never re-send.
+        if getattr(response, "str_result", None) != "SUCC":
+            raise PaymentRejected("결제 응답이 성공이 아닙니다.")
+        return True
 
     def reservations(self):
         history = self.api.get_reservation_history()
-        found = [self._existing(row.raw) for row in history.items]
+        return [self._existing(row.raw) for row in history.items] + self.paid_tickets()
+
+    def paid_tickets(self):
+        """Every train on an issued ticket, across all pages of the list."""
+        found = []
         page, seen_pages, received_rows = 1, set(), 0
         while True:
             try:
